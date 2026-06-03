@@ -7,11 +7,11 @@ import {
   isSameDay,
   isSameMonth,
   startOfMonth,
-  startOfWeek,
 } from 'date-fns'
 import type { Broker, ExcludedDate, Shift } from '../types'
-import { initials } from '../data/brokers'
+import { fullName } from '../data/brokers'
 import WeekendDetail from './WeekendDetail'
+import { downloadMonthsRosterPDF } from '../lib/pdf'
 
 interface Props {
   brokers: Broker[]
@@ -24,6 +24,16 @@ interface Props {
 
 const MONTH_LABEL = (d: Date) => format(d, 'MMMM yyyy')
 
+function getWeekendsInMonth(monthStart: Date): Date[] {
+  const saturdays: Date[] = []
+  let d = monthStart
+  while (isSameMonth(d, monthStart)) {
+    if (getDay(d) === 6) saturdays.push(new Date(d))
+    d = addDays(d, 1)
+  }
+  return saturdays
+}
+
 export default function Calendar({
   brokers,
   shifts,
@@ -34,26 +44,17 @@ export default function Calendar({
 }: Props) {
   const [cursor, setCursor] = useState(() => new Date())
   const [selectedDate, setSelectedDate] = useState<string | null>(null)
+  const [downloading, setDownloading] = useState(false)
 
   const monthStart = startOfMonth(cursor)
-  const gridStart = startOfWeek(monthStart, { weekStartsOn: 1 }) // Mon
-  const days: Date[] = useMemo(() => {
-    const out: Date[] = []
-    let d = gridStart
-    for (let i = 0; i < 42; i++) {
-      out.push(d)
-      d = addDays(d, 1)
-    }
-    return out
-  }, [gridStart])
 
+  const weekends = useMemo(() => getWeekendsInMonth(monthStart), [monthStart])
+
+  // Compute exclusions for the full month range
+  const monthEndStr = format(addDays(addMonths(monthStart, 1), -1), 'yyyy-MM-dd')
   const exclusions = useMemo(
-    () =>
-      exclusionsFor(
-        format(gridStart, 'yyyy-MM-dd'),
-        format(addDays(gridStart, 41), 'yyyy-MM-dd')
-      ),
-    [exclusionsFor, gridStart]
+    () => exclusionsFor(format(monthStart, 'yyyy-MM-dd'), monthEndStr),
+    [exclusionsFor, monthStart, monthEndStr]
   )
 
   const shiftsByDate = useMemo(() => {
@@ -83,11 +84,83 @@ export default function Calendar({
     return m
   }, [blackouts])
 
-  const dayHeaders = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+  function handleDownloadPDF() {
+    setDownloading(true)
+    try {
+      const thisMonth = startOfMonth(cursor)
+      const nextMonth = startOfMonth(addMonths(cursor, 1))
+      downloadMonthsRosterPDF({
+        months: [thisMonth, nextMonth],
+        shifts,
+        brokers,
+        exclusionsFor,
+        blackouts,
+      })
+    } finally {
+      setDownloading(false)
+    }
+  }
+
+  function BrokerPills({ dateStr, dayType }: { dateStr: string; dayType: 'SATURDAY' | 'SUNDAY' }) {
+    const dayShifts = shiftsByDate.get(dateStr) ?? []
+    const exclusion = exclusions.get(dateStr)
+    const dayBlackouts = blackoutsByDate.get(dateStr) ?? []
+    const isToday = isSameDay(new Date(dateStr + 'T00:00:00'), new Date())
+
+    if (exclusion) {
+      return (
+        <div className="flex flex-col justify-center h-full">
+          <span className="text-[11px] font-semibold text-ink-400 uppercase tracking-wide">No shift</span>
+          <span className="text-xs text-ink-500 leading-tight">{exclusion.reason}</span>
+        </div>
+      )
+    }
+
+    if (dayShifts.length === 0) {
+      return <span className="text-xs text-ink-400 italic">No roster yet</span>
+    }
+
+    return (
+      <div className="flex flex-wrap gap-1.5 items-center">
+        {dayShifts.map(s => {
+          const b = s.brokerId ? brokerById.get(s.brokerId) : null
+          const isOptIn =
+            b &&
+            ((dayType === 'SATURDAY' && b.optInSaturdays) ||
+              (dayType === 'SUNDAY' && b.optInSundays))
+          return (
+            <span
+              key={s.slotIndex}
+              className={`inline-flex items-center gap-1 rounded-full text-xs font-semibold px-2.5 py-1 ${
+                b
+                  ? 'bg-white text-brand-700 border border-brand-200 shadow-sm'
+                  : 'bg-amber-50 text-amber-800 border border-amber-200'
+              } ${isToday ? 'ring-1 ring-brand-400' : ''}`}
+              title={b ? fullName(b) : 'Unassigned'}
+            >
+              {b ? fullName(b) : '? Unassigned'}
+              {isOptIn && <span aria-hidden className="text-brand-400">★</span>}
+              {s.locked && <span aria-hidden>🔒</span>}
+              {s.manualOverride && <span aria-hidden>✎</span>}
+            </span>
+          )
+        })}
+        {dayBlackouts.length > 0 && (
+          <span
+            className="inline-flex items-center justify-center rounded-full bg-red-50 text-red-700 border border-red-200 text-[10px] font-semibold px-2 py-0.5"
+            title={`${dayBlackouts.length} blackout${dayBlackouts.length > 1 ? 's' : ''}`}
+          >
+            {dayBlackouts.length} blackout{dayBlackouts.length > 1 ? 's' : ''}
+          </span>
+        )}
+      </div>
+    )
+  }
 
   return (
     <div className="grid lg:grid-cols-[1fr_380px] gap-6">
       <div className="card p-4 sm:p-6">
+        {/* Header row */}
         <div className="flex items-center gap-3 mb-5">
           <button
             className="btn-ghost px-2"
@@ -105,7 +178,7 @@ export default function Calendar({
             ›
           </button>
           <button
-            className="btn-secondary ml-auto text-xs"
+            className="btn-secondary text-xs"
             onClick={() => setCursor(new Date())}
           >
             Today
@@ -119,113 +192,94 @@ export default function Calendar({
             }}
             className="input w-auto text-xs hidden sm:block"
           />
+          <button
+            className="btn-primary ml-auto text-xs flex items-center gap-1.5"
+            onClick={handleDownloadPDF}
+            disabled={downloading}
+            title={`Download PDF for ${MONTH_LABEL(cursor)} & ${MONTH_LABEL(addMonths(cursor, 1))}`}
+          >
+            ⬇ Download Roster PDF
+          </button>
         </div>
 
-        {/* Day headers */}
-        <div className="grid grid-cols-7 gap-1.5 mb-1.5 text-[11px] font-semibold uppercase tracking-widest text-ink-500">
-          {dayHeaders.map((h, i) => (
-            <div key={h} className={`text-center py-1 ${i >= 5 ? 'text-brand-700' : ''}`}>
-              {h}
-            </div>
-          ))}
+        {/* Column headers */}
+        <div className="grid grid-cols-[160px_1fr_1fr] gap-3 mb-2 px-3 text-[11px] font-semibold uppercase tracking-widest text-ink-500">
+          <div>Weekend</div>
+          <div className="text-brand-700">Saturday</div>
+          <div className="text-brand-700">Sunday</div>
         </div>
 
-        <div className="grid grid-cols-7 gap-1.5">
-          {days.map(d => {
-            const dateStr = format(d, 'yyyy-MM-dd')
-            const dow = getDay(d) // 0=Sun, 6=Sat
-            const isWeekend = dow === 0 || dow === 6
-            const inMonth = isSameMonth(d, monthStart)
-            const isToday = isSameDay(d, new Date())
-            const exclusion = exclusions.get(dateStr)
-            const dayShifts = shiftsByDate.get(dateStr) ?? []
-            const dayBlackouts = blackoutsByDate.get(dateStr) ?? []
-            const selected = selectedDate === dateStr
-
-            const baseClasses = [
-              'relative aspect-square sm:aspect-[1.1/1] rounded-xl p-1.5 sm:p-2',
-              'flex flex-col text-left transition',
-              !inMonth ? 'opacity-40' : '',
-              isWeekend
-                ? 'bg-brand-50/60 border border-brand-100 hover:border-brand-300 cursor-pointer'
-                : 'bg-ink-50 border border-transparent',
-              selected ? 'ring-2 ring-brand-600 border-brand-300' : '',
-            ].join(' ')
-
-            const handleClick = () => {
-              if (!isWeekend) return
-              setSelectedDate(dateStr)
-            }
+        {/* Weekend rows */}
+        <div className="flex flex-col gap-2">
+          {weekends.length === 0 && (
+            <div className="text-sm text-ink-400 italic py-8 text-center">No weekends found in this month.</div>
+          )}
+          {weekends.map(saturday => {
+            const sunday = addDays(saturday, 1)
+            const satKey = format(saturday, 'yyyy-MM-dd')
+            const sunKey = format(sunday, 'yyyy-MM-dd')
+            const isSelectedSat = selectedDate === satKey
+            const isSelectedSun = selectedDate === sunKey
+            const isSelected = isSelectedSat || isSelectedSun
+            const isTodaySat = isSameDay(saturday, new Date())
+            const isTodaySun = isSameDay(sunday, new Date())
 
             return (
-              <button
-                key={dateStr}
-                onClick={handleClick}
-                disabled={!isWeekend}
-                className={baseClasses}
+              <div
+                key={satKey}
+                className={`grid grid-cols-[160px_1fr_1fr] gap-3 rounded-xl border transition ${
+                  isSelected
+                    ? 'border-brand-400 ring-2 ring-brand-300 bg-brand-50/40'
+                    : 'border-brand-100 bg-brand-50/20 hover:border-brand-300'
+                }`}
               >
-                <div className="flex items-center justify-between mb-1">
-                  <span
-                    className={`text-xs sm:text-sm font-bold ${isToday ? 'text-brand-600' : 'text-ink-900'}`}
-                  >
-                    {format(d, 'd')}
+                {/* Date label */}
+                <div className="flex flex-col justify-center px-3 py-3 border-r border-brand-100">
+                  <span className="text-sm font-bold text-ink-800">
+                    {format(saturday, 'd')} – {format(sunday, 'd')} {format(saturday, 'MMM')}
                   </span>
-                  {isToday && (
-                    <span className="w-1.5 h-1.5 rounded-full bg-brand-600" aria-label="Today" />
+                  <span className="text-xs text-ink-500 mt-0.5">{format(saturday, 'yyyy')}</span>
+                  {(isTodaySat || isTodaySun) && (
+                    <span className="mt-1 inline-flex items-center gap-1 text-[10px] font-semibold text-brand-600">
+                      <span className="w-1.5 h-1.5 rounded-full bg-brand-600" />
+                      This weekend
+                    </span>
                   )}
                 </div>
 
-                {exclusion && (
-                  <div className="mt-0.5">
-                    <div className="text-[9px] sm:text-[10px] font-semibold uppercase tracking-wide text-ink-500">
-                      No shift
-                    </div>
-                    <div className="text-[10px] sm:text-xs text-ink-700 leading-tight line-clamp-2">
-                      {exclusion.reason}
-                    </div>
+                {/* Saturday cell */}
+                <button
+                  onClick={() => setSelectedDate(satKey)}
+                  className={`text-left px-3 py-3 rounded-l-none transition ${
+                    isSelectedSat ? 'bg-brand-100/60' : 'hover:bg-brand-50'
+                  }`}
+                >
+                  <div className="text-[10px] font-semibold uppercase tracking-wide text-brand-500 mb-1.5">
+                    Sat {format(saturday, 'd MMM')}
+                    {isTodaySat && <span className="ml-1 text-brand-600">· Today</span>}
                   </div>
-                )}
+                  <BrokerPills dateStr={satKey} dayType="SATURDAY" />
+                </button>
 
-                {isWeekend && !exclusion && (
-                  <div className="mt-auto flex flex-wrap gap-1">
-                    {dayShifts.map(s => {
-                      const b = s.brokerId ? brokerById.get(s.brokerId) : null
-                      const isOptIn =
-                        b &&
-                        ((s.dayType === 'SATURDAY' && b.optInSaturdays) ||
-                          (s.dayType === 'SUNDAY' && b.optInSundays))
-                      return (
-                        <span
-                          key={s.slotIndex}
-                          className={`inline-flex items-center gap-1 rounded-full text-[10px] sm:text-[11px] font-semibold px-1.5 py-0.5 ${
-                            b
-                              ? 'bg-white text-brand-700 border border-brand-200'
-                              : 'bg-amber-50 text-amber-800 border border-amber-200'
-                          }`}
-                          title={b ? `${b.firstName} ${b.lastName ?? ''}` : 'Unassigned'}
-                        >
-                          {b ? initials(b) : '?'}
-                          {isOptIn && <span aria-hidden>★</span>}
-                          {s.locked && <span aria-hidden>🔒</span>}
-                          {s.manualOverride && <span aria-hidden>✎</span>}
-                        </span>
-                      )
-                    })}
-                    {dayBlackouts.length > 0 && (
-                      <span
-                        className="inline-flex items-center justify-center rounded-full bg-red-50 text-red-700 border border-red-200 text-[10px] font-semibold w-4 h-4"
-                        title={`${dayBlackouts.length} blackout${dayBlackouts.length > 1 ? 's' : ''}`}
-                      >
-                        {dayBlackouts.length}
-                      </span>
-                    )}
+                {/* Sunday cell */}
+                <button
+                  onClick={() => setSelectedDate(sunKey)}
+                  className={`text-left px-3 py-3 border-l border-brand-100 rounded-r-xl transition ${
+                    isSelectedSun ? 'bg-brand-100/60' : 'hover:bg-brand-50'
+                  }`}
+                >
+                  <div className="text-[10px] font-semibold uppercase tracking-wide text-brand-500 mb-1.5">
+                    Sun {format(sunday, 'd MMM')}
+                    {isTodaySun && <span className="ml-1 text-brand-600">· Today</span>}
                   </div>
-                )}
-              </button>
+                  <BrokerPills dateStr={sunKey} dayType="SUNDAY" />
+                </button>
+              </div>
             )
           })}
         </div>
 
+        {/* Legend */}
         <div className="mt-5 flex flex-wrap gap-3 text-xs text-ink-500">
           <span className="inline-flex items-center gap-1.5">
             <span className="w-3 h-3 rounded bg-brand-50 border border-brand-100" /> Weekend
